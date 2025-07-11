@@ -15,93 +15,89 @@ print(" Loading Delhi-NCR shapefile...")
 ncr = gpd.read_file("data/delhi_ncr_region.geojson")
 print(f"Original CRS: {ncr.crs}")
 
-# Reproject to EPSG:32644 for distance in meters
+# Reproject to EPSG:32644 for metric distances
 ncr = ncr.to_crs("EPSG:32644")
 print(f"Projected CRS: {ncr.crs}")
 
-# ---------- STEP 2: Create 60x60 km grid ----------
+# ---------- STEP 2: Create 60×60 km grid ----------
 print(" Creating 60×60 km grid...")
 grid_size = 60000  # in meters
 minx, miny, maxx, maxy = ncr.total_bounds
-grid_cells = []
-
-for x in range(int(minx), int(maxx), grid_size):
-    for y in range(int(miny), int(maxy), grid_size):
-        grid_cells.append(box(x, y, x + grid_size, y + grid_size))
-
+grid_cells = [box(x, y, x + grid_size, y + grid_size)
+              for x in range(int(minx), int(maxx), grid_size)
+              for y in range(int(miny), int(maxy), grid_size)]
 grid = gpd.GeoDataFrame({'geometry': grid_cells}, crs="EPSG:32644")
 print(f"Generated {len(grid)} grid cells.")
 
-# ---------- STEP 3: Plot grid over shapefile ----------
-print(" Saving static grid plot...")
+# ---------- STEP 3: Save static matplotlib plot ----------
 os.makedirs("outputs", exist_ok=True)
+print(" Saving static grid plot...")
 fig, ax = plt.subplots(figsize=(10, 10))
-ncr.plot(ax=ax, facecolor='none', edgecolor='blue')
-grid.plot(ax=ax, facecolor='none', edgecolor='red', linewidth=0.5)
+ncr.plot(ax=ax, facecolor='none', edgecolor='blue', label='Delhi NCR Boundary')
+grid.plot(ax=ax, facecolor='none', edgecolor='red', linewidth=0.5, label='Grid')
+plt.legend()
 plt.title("Delhi-NCR with 60×60 km Grid")
-plt.xlabel("Easting (m)")
-plt.ylabel("Northing (m)")
-plt.grid(True)
 plt.savefig("outputs/q1_matplotlib_plot.png")
 plt.close()
-print("Plot saved as outputs/q1_matplotlib_plot.png")
 
-# ---------- STEP 4: Interactive satellite map using geemap (no GEE login) ----------
-print(" Generating satellite basemap (no Earth Engine)...")
-grid_wgs = grid.to_crs("EPSG:4326")
-centers = grid.geometry.centroid
-centers_gdf = gpd.GeoDataFrame(geometry=centers, crs=grid.crs).to_crs("EPSG:4326")
-
-m = geemap.Map(center=[28.6, 77.2], zoom=8, ee_initialize=False)  # disables Earth Engine
-m.add_basemap("SATELLITE")
-m.add_gdf(grid_wgs, layer_name="Grid")
-m.add_gdf(centers_gdf, layer_name="Grid Centers", style={"color": "yellow", "radius": 5})
-m.to_html("outputs/q1_geemap_satellite.html")
-print("Interactive map saved as outputs/q1_geemap_satellite.html")
-
-# ---------- STEP 5: Load image filenames and extract coordinates ----------
-print(" Parsing image filenames from data/rgb/ ...")
+# ---------- STEP 4: Load RGB image coordinates ----------
+print(" Parsing RGB image filenames...")
 image_dir = "data/rgb"
 image_files = [f for f in os.listdir(image_dir) if f.endswith(".png")]
 
 records = []
-for filename in image_files:
+for fname in image_files:
     try:
-        lat_str, lon_str = filename.replace(".png", "").split("_")
-        lat, lon = float(lat_str), float(lon_str)
-        records.append((filename, lat, lon))
-    except ValueError:
-        print(f" Skipping malformed filename: {filename}")
+        lat, lon = map(float, fname.replace(".png", "").split("_"))
+        records.append((fname, lat, lon))
+    except:
+        print(f" Skipping malformed filename: {fname}")
 
 image_df = pd.DataFrame(records, columns=["filename", "latitude", "longitude"])
-geometry = [Point(lon, lat) for lat, lon in zip(image_df.latitude, image_df.longitude)]
-image_gdf = gpd.GeoDataFrame(image_df, geometry=geometry, crs="EPSG:4326")
+image_gdf = gpd.GeoDataFrame(image_df,
+    geometry=gpd.points_from_xy(image_df.longitude, image_df.latitude),
+    crs="EPSG:4326")
 image_gdf_proj = image_gdf.to_crs("EPSG:32644")
-
 print(f"Total images: {len(image_gdf_proj)}")
 
-# ---------- STEP 6: Fast spatial filtering using bounding boxes ----------
-print(" Filtering images that fall within the grid (bounding box method)...")
+# ---------- STEP 5: Fast spatial filtering ----------
+print(" Filtering images inside grid cells...")
 grid_sindex = grid.sindex
-
 filtered_list = []
-start_filter = time.time()
 
+start_filter = time.time()
 for idx, img in image_gdf_proj.iterrows():
-    possible_matches_idx = list(grid_sindex.intersection(img.geometry.bounds))
-    possible_matches = grid.iloc[possible_matches_idx]
-    for _, cell in possible_matches.iterrows():
+    matches_idx = list(grid_sindex.intersection(img.geometry.bounds))
+    for _, cell in grid.iloc[matches_idx].iterrows():
         if cell.geometry.contains(img.geometry):
             filtered_list.append(img)
             break
-
-filtered = gpd.GeoDataFrame(filtered_list, crs=image_gdf_proj.crs)
 end_filter = time.time()
 
-print(f" Filtered {len(filtered)} images (out of {len(image_gdf_proj)}) in {end_filter - start_filter:.2f} seconds.")
-
-# ---------- STEP 7: Save filtered list ----------
+filtered = gpd.GeoDataFrame(filtered_list, crs=image_gdf_proj.crs)
+print(f" Filtered {len(filtered)} / {len(image_gdf_proj)} images in {end_filter - start_filter:.2f}s")
 filtered[['filename', 'latitude', 'longitude']].to_csv("outputs/q1_filtered_images.csv", index=False)
-print(" Saved filtered image list to outputs/q1_filtered_images.csv")
 
-print(f"\n Q1 Complete. Total time: {time.time() - start_total:.2f} seconds.")
+# ---------- STEP 6: Create geemap interactive satellite map ----------
+print(" Creating interactive geemap...")
+grid_wgs = grid.to_crs("EPSG:4326")
+centers = grid.geometry.centroid.to_crs("EPSG:4326")
+centers_gdf = gpd.GeoDataFrame(geometry=centers, crs="EPSG:4326")
+
+ncr_wgs = ncr.to_crs("EPSG:4326")
+filtered_wgs = filtered.to_crs("EPSG:4326")
+
+m = geemap.Map(center=[28.6, 77.2], zoom=8, ee_initialize=False)
+m.add_basemap("SATELLITE")
+
+# Add layers
+m.add_gdf(grid_wgs, layer_name="Grid (60x60 km)", style={"color": "red"})
+m.add_gdf(centers_gdf, layer_name="Grid Centers", style={"color": "yellow", "radius": 4})
+m.add_gdf(ncr_wgs, layer_name="Delhi NCR Boundary", style={"color": "blue"})
+m.add_gdf(filtered_wgs, layer_name="Image Patch Centers", style={"color": "lime", "radius": 3})
+
+# Save to HTML
+m.to_html("outputs/q1_geemap_satellite.html")
+print(" Saved interactive map: outputs/q1_geemap_satellite.html")
+
+print(f"\n✅ Q1 Complete. Total time: {time.time() - start_total:.2f} seconds.")
